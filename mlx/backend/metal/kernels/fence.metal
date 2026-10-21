@@ -55,7 +55,8 @@ constexpr constant metal::thread_scope thread_scope_system =
     uint cur = __metal_atomic_load_explicit(
         timestamp,
         int(metal::memory_order_relaxed),
-        __METAL_MEMORY_SCOPE_SYSTEM__);
+        __METAL_MEMORY_SCOPE_SYSTEM__,
+        0);
     if (cur >= value) {
       return;
     }
