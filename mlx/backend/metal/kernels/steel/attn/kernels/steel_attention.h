@@ -1,4 +1,4 @@
-// Copyright © 2024-25 Apple Inc.
+// Copyright © 2024-26 Apple Inc.
 
 #include "mlx/backend/metal/kernels/steel/attn/attn.h"
 
@@ -14,6 +14,7 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+constant bool save_lse [[function_constant(303)]];
 
 struct MaxOp {
   template <typename T>
@@ -63,6 +64,7 @@ template <
     int BQ,
     int BK,
     int BD,
+    int BV,
     int WM,
     int WN,
     typename MaskType = float,
@@ -76,6 +78,7 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    device float* lse [[buffer(8), function_constant(save_lse)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -102,30 +105,33 @@ template <
       tidl.y * params->O_strides[1] + // Head
       tidl.x * BQ * params->O_strides[2]; // Sequence
 
+  if (save_lse) {
+    lse += tidl.z * params->H * params->qL + // Batch
+        tidl.y * params->qL + // Head
+        tidl.x * BQ; // Sequence
+  }
+
   if (has_mask) {
     mask += tidl.z * mask_params->M_strides[0] + // Batch
         tidl.y * mask_params->M_strides[1]; // Head
   }
 
-  // D-block tiling for BD>256. For BD<=256: D_BLK=BD, N_DBLK=1 (no-op).
-  constexpr short D_BLK = (BD > 256) ? 8 : BD;
-  constexpr short N_DBLK = BD / D_BLK;
-  constexpr short TD_BLK = D_BLK / 8;
+  // Prepare threadgroup memory
+  constexpr short padQ = 16 / sizeof(T);
+  constexpr short padK = 16 / sizeof(T);
+  constexpr short padV = 16 / sizeof(T);
 
-  // Prepare threadgroup memory — uses D_BLK for BD>256, BD otherwise.
-  constexpr short padQ = (BD > 256) ? 0 : (16 / sizeof(T));
-  constexpr short padK = (BD > 256) ? 0 : (16 / sizeof(T));
-  constexpr short padV = (BD > 256) ? 0 : (16 / sizeof(T));
-
-  constexpr short LDQ_tgp = D_BLK + padQ;
+  constexpr short LDQ_tgp = BD + padQ;
   constexpr short LDK_tgp = BK + padK;
-  constexpr short LDV_tgp = D_BLK + padV;
+  constexpr short LDV_tgp = BV + padV;
 
-  constexpr short tgp_mem_0 = (BK + padK) * (D_BLK);
-  constexpr short tgp_mem_1 = BK * (D_BLK + padV);
+  constexpr short tgp_mem_0 = (BK + padK) * (BD);
+  constexpr short tgp_mem_1 = BK * (BV + padV);
   constexpr short tgp_mem_s = tgp_mem_0 > tgp_mem_1 ? tgp_mem_0 : tgp_mem_1;
+  constexpr bool q_in_registers = (WN == 2) && (BK == 32 || sizeof(T) == 4);
+  constexpr short q_tgp_mem_s = q_in_registers ? 1 : BQ * (BD + padQ);
 
-  threadgroup T Q_smem[BQ * (D_BLK + padQ)];
+  threadgroup T Q_smem[q_tgp_mem_s];
   threadgroup T KV_smem[tgp_mem_s];
 
   threadgroup T* Qs = Q_smem;
@@ -136,40 +142,30 @@ template <
   using QBlockLoader = BlockLoaderT<
       /* typename T = */ T,
       /* short BROWS = */ BQ,
-      /* short BCOLS = */ D_BLK,
+      /* short BCOLS = */ BD,
       /* short kDstStrRow = */ LDQ_tgp,
       /* short kDstStrCol = */ 1,
       /* short reduction_dim = */ 1,
       /* short tgp_size = */ WM * WN * 32>;
 
-  // K/V loaders with explicit derived params (needed for BK>=128).
-  constexpr short kv_n_reads = (D_BLK * BK) / (WM * WN * 32);
-  constexpr short kv_tcols = D_BLK / kv_n_reads;
-  constexpr short kv_trows = (WM * WN * 32) / kv_tcols;
-
+  // K is loaded in transposed
   using KBlockLoader = BlockLoaderT<
-      T,
-      BK,
-      D_BLK,
-      1,
-      LDK_tgp,
-      0,
-      WM * WN * 32,
-      kv_n_reads,
-      kv_tcols,
-      kv_trows>;
+      /* typename T = */ T,
+      /* short BROWS = */ BK,
+      /* short BCOLS = */ BD,
+      /* short kDstStrRow = */ 1,
+      /* short kDstStrCol = */ LDK_tgp,
+      /* short reduction_dim = */ 0,
+      /* short tgp_size = */ WM * WN * 32>;
 
   using VBlockLoader = BlockLoaderT<
-      T,
-      BK,
-      D_BLK,
-      LDV_tgp,
-      1,
-      0,
-      WM * WN * 32,
-      kv_n_reads,
-      kv_tcols,
-      kv_trows>;
+      /* typename T = */ T,
+      /* short BROWS = */ BK,
+      /* short BCOLS = */ BV,
+      /* short kDstStrRow = */ LDV_tgp,
+      /* short kDstStrCol = */ 1,
+      /* short reduction_dim = */ 0,
+      /* short tgp_size = */ WM * WN * 32>;
 
   QBlockLoader loader_q(
       Q, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);
@@ -183,8 +179,15 @@ template <
   // Prepare MMA tiles
   constexpr short kFragSize = 8; // MMAFrag size
   using MMAFrag_acc_t = BaseMMAFrag<AccumType, kFragSize, kFragSize>;
+  using MMAInType = metal::conditional_t<WN == 2, T, AccumType>;
+  using MMAFrag_in_t = BaseMMAFrag<MMAInType, kFragSize, kFragSize>;
 
-  constexpr int kNWarps = WM * WN;
+  static_assert(WN == 1 || WN == 2, "WN must be 1 or 2");
+  static_assert(
+      BD % WN == 0 && BV % WN == 0,
+      "The head dims must split evenly across WN");
+
+  constexpr int kNWarps = WM;
   static_assert(
       BQ >= (kNWarps * kFragSize) && BQ % (kNWarps * kFragSize) == 0,
       "Each simdgroup must host atleast 1 simdgroup matrix along Q sequence.");
@@ -195,26 +198,66 @@ template <
   constexpr int TK = BK / kFragSize;
   // HeadDim frags (all warps load the same frags)
   constexpr int TD = BD / kFragSize;
+  constexpr int TDh = TD / WN;
+  constexpr int BDh = BD / WN;
+  constexpr int TVh = BV / (kFragSize * WN);
+  constexpr int BVh = BV / WN;
 
   static_assert(TQ == 1, "Check TQ");
 
-  MMATile<AccumType, TQ, 1, MMAFrag_acc_t> Qtile;
-  MMATile<AccumType, 1, TK, MMAFrag_acc_t> Ktile;
+  MMATile<MMAInType, TQ, 1, MMAFrag_in_t> Qtile;
+  MMATile<MMAInType, 1, TK, MMAFrag_in_t> Ktile;
   MMATile<AccumType, TQ, TK, MMAFrag_acc_t> Stile;
-  MMATile<AccumType, 1, 1, MMAFrag_acc_t> Vtile;
+  MMATile<MMAInType, 1, 1, MMAFrag_in_t> Vtile;
+  MMATile<AccumType, TQ, TVh, MMAFrag_acc_t> Otile;
+  MMATile<MMAInType, 1, 1, MMAFrag_in_t> Qtiles[q_in_registers ? TDh : 1];
+
+  Otile.clear();
 
   // Prepare mma tile offsets
   const short2 simd_coord = MMAFrag_acc_t::get_coord(simd_lane_id);
   const short sm = simd_coord.y;
   const short sn = simd_coord.x;
-  const short tm = kFragSize * TQ * simd_group_id;
+  const short row_group = simd_group_id / WN;
+  const short d_half = simd_group_id % WN;
+  const short tm = kFragSize * TQ * row_group;
 
-  const short Qs_offset = (tm + sm) * LDQ_tgp + sn;
-  const short Ks_offset = sm * LDK_tgp + sn;
-  const short Vs_offset = sm * LDV_tgp + sn;
+  const short Qs_offset = (tm + sm) * LDQ_tgp + d_half * BDh + sn;
+  const short Ks_offset = d_half * BDh * LDK_tgp + sm * LDK_tgp + sn;
+  const short Vs_offset = sm * LDV_tgp + d_half * BVh + sn;
 
   constexpr short Qs_tile_stride = kFragSize;
   constexpr short Ks_tile_stride = kFragSize * LDK_tgp;
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if constexpr (!q_in_registers) {
+    if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
+      loader_q.load_safe(short2(BD, params->qL_rem));
+    } else {
+      loader_q.load_unsafe();
+    }
+  } else {
+    STEEL_PRAGMA_UNROLL
+    for (short dd = 0; dd < TDh; dd++) {
+      const device T* q_src = Q + (tm + sm) * params->Q_strides[2] +
+          d_half * BDh + dd * kFragSize + sn;
+      if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
+        MMAFrag_in_t::load_safe(
+            Qtiles[dd].frag_at(0, 0),
+            q_src,
+            params->Q_strides[2],
+            Int<1>{},
+            params->qL_rem - (tm + sm),
+            BDh - (dd * kFragSize + sn),
+            Int<0>{},
+            Int<0>{});
+      } else {
+        MMAFrag_in_t::load(
+            Qtiles[dd].frag_at(0, 0), q_src, params->Q_strides[2], Int<1>{});
+      }
+    }
+  }
 
   // Init row reduction variables
   constexpr short kRowsPT = decltype(Stile)::kRowsPerThread;
@@ -222,6 +265,7 @@ template <
   AccumType max_score[kRowsPT];
   AccumType sum_score[kRowsPT] = {0};
 
+  // Init to -Inf
   STEEL_PRAGMA_UNROLL
   for (short i = 0; i < kRowsPT; ++i) {
     max_score[i] = Limits<AccumType>::finite_min;
@@ -248,23 +292,6 @@ template <
     kb_min_causal = (q_min / BK);
   }
 
-  // clang-format off
-  if constexpr (N_DBLK == 1) {
-  // ================================================================
-  // ORIGINAL CODE PATH — BD<=256 — completely unchanged
-  // ================================================================
-  MMATile<AccumType, TQ, TD, MMAFrag_acc_t> Otile;
-  Otile.clear();
-
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-
-  // Load Q blocks
-  if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
-    loader_q.load_safe(short2(BD, params->qL_rem));
-  } else {
-    loader_q.load_unsafe();
-  }
-
   // Loop over KV seq length
   for (int kb = 0; kb < kb_lim; kb++) {
     // Load K block and apply scale
@@ -281,17 +308,51 @@ template <
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     STEEL_PRAGMA_UNROLL
-    for (short dd = 0; dd < TD; dd++) {
+    for (short dd = 0; dd < TDh; dd++) {
       simdgroup_barrier(mem_flags::mem_none);
 
-      Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
-          &Qs[Qs_offset + dd * Qs_tile_stride]);
+      if constexpr (!q_in_registers) {
+        Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
+            &Qs[Qs_offset + dd * Qs_tile_stride]);
+      }
       Ktile.template load<T, 1, 1, LDK_tgp, 1>(
           &Ks[Ks_offset + dd * Ks_tile_stride]);
 
       simdgroup_barrier(mem_flags::mem_none);
 
-      tile_matmad(Stile, Qtile, Ktile, Stile);
+      if constexpr (!q_in_registers) {
+        tile_matmad(Stile, Qtile, Ktile, Stile);
+      } else {
+        tile_matmad(Stile, Qtiles[dd], Ktile, Stile);
+      }
+    }
+
+    if constexpr (WN == 2) {
+      constexpr int s_xchg_stride = decltype(Stile)::kElemsPerTile * 32;
+      constexpr int s_xchg_size = WM * WN * s_xchg_stride;
+      static_assert(
+          s_xchg_size * sizeof(AccumType) <= tgp_mem_s * sizeof(T),
+          "The score exchange must fit in KV_smem");
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup AccumType* s_xchg =
+          reinterpret_cast<threadgroup AccumType*>(KV_smem);
+      threadgroup AccumType* slot =
+          s_xchg + (row_group * WN + d_half) * s_xchg_stride;
+      const short base = short(simd_lane_id) * decltype(Stile)::kElemsPerTile;
+
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        slot[base + ii] = Stile.elems()[ii];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      const threadgroup AccumType* peer =
+          s_xchg + (row_group * WN + 1 - d_half) * s_xchg_stride;
+      STEEL_PRAGMA_UNROLL
+      for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
+        Stile.elems()[ii] += peer[base + ii];
+      }
     }
 
     // Apply scale in float32
@@ -392,7 +453,7 @@ template <
 
     // Load V blocks
     if (!align_K && kb == (params->NK_aligned)) {
-      loader_v.load_safe(short2(BD, params->kL_rem));
+      loader_v.load_safe(short2(BV, params->kL_rem));
     } else {
       loader_v.load_unsafe();
     }
@@ -444,10 +505,10 @@ template <
     STEEL_PRAGMA_UNROLL
     for (short iq = 0; iq < TQ; iq++) {
       STEEL_PRAGMA_UNROLL
-      for (short id = 0; id < TD; id++) {
+      for (short id = 0; id < TVh; id++) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          if constexpr (BD == 128) {
+          if constexpr (BD >= 128) {
             simdgroup_barrier(mem_flags::mem_none);
           }
 
@@ -457,7 +518,7 @@ template <
           Vtile.template load<T, 1, 1, LDV_tgp, 1>(
               &Vs[Vs_offset + kk * LDV_tgp + dd]);
 
-          if constexpr (BD == 128) {
+          if constexpr (BD >= 128) {
             simdgroup_barrier(mem_flags::mem_none);
           }
 
@@ -479,11 +540,25 @@ template <
   Otile.template row_bin_op<DivOp>(sum_score);
   threadgroup_barrier(mem_flags::mem_none);
 
+  // Store the logsumexp for the backward pass
+  if (save_lse && sn == 0) {
+    using stile_t = decltype(Stile);
+    const bool is_last_q = int(tid.x) == (params->NQ_aligned);
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kRowsPT; ++i) {
+      const short r = tm + sm + i * stile_t::kFragRows;
+      if (align_Q || !is_last_q || r < params->qL_rem) {
+        lse[r] = M_LN2_F * (max_score[i] + metal::log2(sum_score[i]));
+      }
+    }
+  }
+
   // Store results
-  O += (tm + sm) * params->O_strides[2] + sn;
+  O += (tm + sm) * params->O_strides[2] + d_half * BVh + sn;
 
   if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
-    auto dst_tile_dims = short2(BD - sn, params->qL_rem - (tm + sm));
+    auto dst_tile_dims = short2(BVh - sn, params->qL_rem - (tm + sm));
 
     if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0)
       return;
@@ -492,204 +567,4 @@ template <
   } else {
     Otile.template store<T, 1, 1>(O, params->O_strides[2]);
   }
-
-  } else {
-  // ================================================================
-  // D-BLOCK PATH — BD>256 — D-block tiled flash attention
-  // ================================================================
-  MMATile<AccumType, TQ, TD_BLK, MMAFrag_acc_t> Otiles[N_DBLK];
-  STEEL_PRAGMA_UNROLL
-  for (short db = 0; db < N_DBLK; db++) {
-    Otiles[db].clear();
-  }
-
-  for (int kb = 0; kb < kb_lim; kb++) {
-    Stile.clear();
-
-    // Q@K^T across D-blocks
-    for (short db = 0; db < N_DBLK; db++) {
-      const int d_off = db * D_BLK;
-      QBlockLoader lq(
-          Q + d_off, params->Q_strides[2], Qs, simd_group_id, simd_lane_id);
-      KBlockLoader lk(
-          K + (int64_t)kb * BK * params->K_strides[2] + d_off,
-          params->K_strides[2], Ks, simd_group_id, simd_lane_id);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
-        lq.load_safe(short2(D_BLK, params->qL_rem));
-      } else { lq.load_unsafe(); }
-      if (!align_K && kb == (params->NK_aligned)) {
-        lk.load_safe(short2(D_BLK, params->kL_rem));
-      } else { lk.load_unsafe(); }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      STEEL_PRAGMA_UNROLL
-      for (short dd = 0; dd < TD_BLK; dd++) {
-        simdgroup_barrier(mem_flags::mem_none);
-        Qtile.template load<T, 1, 1, LDQ_tgp, 1>(
-            &Qs[Qs_offset + dd * Qs_tile_stride]);
-        Ktile.template load<T, 1, 1, LDK_tgp, 1>(
-            &Ks[Ks_offset + dd * Ks_tile_stride]);
-        simdgroup_barrier(mem_flags::mem_none);
-        tile_matmad(Stile, Qtile, Ktile, Stile);
-      }
-    }
-
-    // Scale
-    STEEL_PRAGMA_UNROLL
-    for (short ii = 0; ii < decltype(Stile)::kElemsPerTile; ii++) {
-      Stile.elems()[ii] *= scale;
-    }
-
-    // Mask out length sequence
-    if (!align_K && kb == (params->NK_aligned)) {
-      using stile_t = decltype(Stile);
-      constexpr auto neg_inf = Limits<typename stile_t::elem_type>::finite_min;
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < stile_t::kTileRows; i++) {
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < stile_t::kTileCols; j++) {
-          short col_pos = sn + (j * stile_t::kFragCols);
-          STEEL_PRAGMA_UNROLL
-          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
-            if ((col_pos + jj) >= params->kL_rem)
-              Stile.frag_at(i, j)[jj] = neg_inf;
-          }
-        }
-      }
-    }
-
-    // Causal mask
-    if (do_causal && kb >= kb_min_causal) {
-      using stile_t = decltype(Stile);
-      constexpr auto neg_inf = Limits<typename stile_t::elem_type>::finite_min;
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < stile_t::kTileRows; i++) {
-        const int row_pos =
-            tid.x * BQ + params->qL_off + tm + sm + (i * stile_t::kFragRows);
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < stile_t::kTileCols; j++) {
-          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
-          STEEL_PRAGMA_UNROLL
-          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
-            if (row_pos < (col_pos + jj))
-              Stile.frag_at(i, j)[jj] = neg_inf;
-          }
-        }
-      }
-    }
-
-    // Array mask
-    if (has_mask) {
-      using stile_t = decltype(Stile);
-      using selem_t = typename stile_t::elem_type;
-      constexpr auto neg_inf = Limits<selem_t>::finite_min;
-      constexpr bool is_bool = is_same_v<MaskType, bool>;
-      using melem_t = typename metal::conditional_t<is_bool, bool, selem_t>;
-      using MMAFrag_mask_t = BaseMMAFrag<melem_t, kFragSize, kFragSize>;
-      using frag_t = typename MMAFrag_mask_t::frag_type;
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < stile_t::kTileRows; i++) {
-        const int row_pos = tid.x * BQ + tm + sm + (i * stile_t::kFragRows);
-        STEEL_PRAGMA_UNROLL
-        for (short j = 0; j < stile_t::kTileCols; j++) {
-          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
-          frag_t mfrag;
-          MMAFrag_mask_t::load_safe(mfrag, mask,
-              int64_t(mask_params->M_strides[2]), Int<1>{},
-              params->qL, params->kL, row_pos, col_pos);
-          STEEL_PRAGMA_UNROLL
-          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemsPerFrag; jj++) {
-            if constexpr (is_bool) {
-              Stile.frag_at(i, j)[jj] =
-                  mfrag[jj] ? Stile.frag_at(i, j)[jj] : neg_inf;
-            } else {
-              Stile.frag_at(i, j)[jj] += M_LOG2E_F * selem_t(mfrag[jj]);
-            }
-          }
-        }
-      }
-    }
-
-    // Softmax
-    AccumType new_max[kRowsPT];
-    AccumType factor[kRowsPT];
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) { new_max[i] = max_score[i]; }
-    Stile.template row_reduce<MaxOp>(new_max);
-    Stile.template row_bin_op<ExpSubOp>(new_max);
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) {
-      factor[i] = fast::exp2(max_score[i] - new_max[i]);
-    }
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) { max_score[i] = new_max[i]; }
-    AccumType sum_score_tmp[kRowsPT] = {0};
-    Stile.template row_reduce<SumOp>(sum_score_tmp);
-    STEEL_PRAGMA_UNROLL
-    for (short i = 0; i < kRowsPT; ++i) {
-      sum_score[i] = sum_score[i] * factor[i] + sum_score_tmp[i];
-    }
-
-    // Correct ALL output blocks
-    STEEL_PRAGMA_UNROLL
-    for (short db = 0; db < N_DBLK; db++) {
-      Otiles[db].template row_bin_op<MulOp>(factor);
-    }
-
-    // P@V per D-block
-    for (short db = 0; db < N_DBLK; db++) {
-      const int d_off = db * D_BLK;
-      VBlockLoader lv(
-          V + (int64_t)kb * BK * params->V_strides[2] + d_off,
-          params->V_strides[2], Vs, simd_group_id, simd_lane_id);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (!align_K && kb == (params->NK_aligned)) {
-        lv.load_safe(short2(D_BLK, params->kL_rem));
-      } else { lv.load_unsafe(); }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      STEEL_PRAGMA_UNROLL
-      for (short iq = 0; iq < TQ; iq++) {
-        STEEL_PRAGMA_UNROLL
-        for (short id = 0; id < TD_BLK; id++) {
-          STEEL_PRAGMA_UNROLL
-          for (short ik = 0; ik < TK; ik++) {
-            simdgroup_barrier(mem_flags::mem_none);
-            const short kk = ik * kFragSize;
-            const short dd = id * kFragSize;
-            Vtile.template load<T, 1, 1, LDV_tgp, 1>(
-                &Vs[Vs_offset + kk * LDV_tgp + dd]);
-            simdgroup_barrier(mem_flags::mem_none);
-            MMAFrag_acc_t::mma(
-                Otiles[db].frag_at(iq, id),
-                Stile.frag_at(iq, ik),
-                Vtile.frag_at(0, 0),
-                Otiles[db].frag_at(iq, id));
-          }
-        }
-      }
-    }
-  }
-
-  // Normalize and store each D-block
-  O += (tm + sm) * params->O_strides[2] + sn;
-  STEEL_PRAGMA_UNROLL
-  for (short db = 0; db < N_DBLK; db++) {
-    Otiles[db].template row_bin_op<DivOp>(sum_score);
-  }
-  threadgroup_barrier(mem_flags::mem_none);
-  STEEL_PRAGMA_UNROLL
-  for (short db = 0; db < N_DBLK; db++) {
-    device T* O_blk = O + db * D_BLK;
-    if (!align_Q && int(tid.x) == (params->NQ_aligned)) {
-      auto dst_tile_dims = short2(D_BLK - sn, params->qL_rem - (tm + sm));
-      if (dst_tile_dims.x <= 0 || dst_tile_dims.y <= 0) continue;
-      Otiles[db].template store_safe<T, 1, 1>(
-          O_blk, params->O_strides[2], dst_tile_dims);
-    } else {
-      Otiles[db].template store<T, 1, 1>(O_blk, params->O_strides[2]);
-    }
-  }
-
-  } // end if constexpr (N_DBLK)
-  // clang-format on
 }

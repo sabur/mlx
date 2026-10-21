@@ -135,7 +135,9 @@ __global__ void binary_g_nd(
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      (grid.block_index().z * grid.dim_blocks().y + grid.block_index().y) *
+          block.dim_threads().y +
+      block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -173,7 +175,9 @@ __global__ void binary_g(
   auto block = cg::this_thread_block();
   auto grid = cg::this_grid();
   IdxT index_rest =
-      grid.block_index().y * block.dim_threads().y + block.thread_index().y;
+      (grid.block_index().z * grid.dim_blocks().y + grid.block_index().y) *
+          block.dim_threads().y +
+      block.thread_index().y;
   if (index_rest >= size_rest) {
     return;
   }
@@ -205,9 +209,10 @@ __global__ void binary_g(
 template <typename Op, typename In, typename Out>
 constexpr bool supports_binary_op() {
   if (std::is_same_v<Op, Add> || std::is_same_v<Op, Divide> ||
-      std::is_same_v<Op, Maximum> || std::is_same_v<Op, Minimum> ||
-      std::is_same_v<Op, Multiply> || std::is_same_v<Op, Subtract> ||
-      std::is_same_v<Op, Power> || std::is_same_v<Op, Remainder>) {
+      std::is_same_v<Op, FloorDivide> || std::is_same_v<Op, Maximum> ||
+      std::is_same_v<Op, Minimum> || std::is_same_v<Op, Multiply> ||
+      std::is_same_v<Op, Subtract> || std::is_same_v<Op, Power> ||
+      std::is_same_v<Op, Remainder>) {
     return std::is_same_v<In, Out>;
   }
   if (std::is_same_v<Op, Equal> || std::is_same_v<Op, Greater> ||
@@ -283,10 +288,8 @@ void binary_op_gpu_inplace(
                 if (dim0 >= 4) {
                   work_per_thread = 4;
                 }
-                dim0 = (dim0 + work_per_thread - 1) / work_per_thread;
-                auto block_dims = get_block_dims(dim0, rest, 1);
-                uint32_t num_blocks_x = cuda::ceil_div(dim0, block_dims.x);
-                uint32_t num_blocks_y = cuda::ceil_div(rest, block_dims.y);
+                auto [grid_dims, block_dims] =
+                    get_launch_args_general(dim0, rest, work_per_thread);
                 if (ndim <= 3) {
                   dispatch_1_2_3(ndim, [&](auto dims_constant) {
                     auto kernel = cu::binary_g_nd<
@@ -307,7 +310,7 @@ void binary_op_gpu_inplace(
                     }
                     encoder.add_kernel_node(
                         kernel,
-                        {num_blocks_x, num_blocks_y},
+                        grid_dims,
                         block_dims,
                         gpu_ptr<InType>(a),
                         gpu_ptr<InType>(b),
@@ -324,7 +327,7 @@ void binary_op_gpu_inplace(
                   }
                   encoder.add_kernel_node(
                       kernel,
-                      {num_blocks_x, num_blocks_y},
+                      grid_dims,
                       block_dims,
                       gpu_ptr<InType>(a),
                       gpu_ptr<InType>(b),

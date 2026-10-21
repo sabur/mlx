@@ -39,10 +39,13 @@ are the CPU and GPU.
    usage/lazy_evaluation
    usage/unified_memory
    usage/indexing
+   usage/kv_cache
    usage/saving_and_loading
    usage/function_transforms
    usage/compile
    usage/numpy
+   usage/precision
+   usage/environment_variables
    usage/distributed
    usage/using_streams
    usage/export
@@ -95,3 +98,4 @@ are the CPU and GPU.
    dev/metal_logging
    dev/custom_metal_kernels
    dev/mlx_in_cpp
+   dev/release

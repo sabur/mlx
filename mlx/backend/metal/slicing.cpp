@@ -50,6 +50,13 @@ array compute_dynamic_offset(
   auto& d = metal::device(s.device);
   auto& compute_encoder = metal::get_command_encoder(s);
 
+  // The kernel reads the indices contiguously
+  if (!indices.flags().row_contiguous) {
+    auto copy = contiguous_copy_gpu(indices, s);
+    compute_encoder.add_temporary(copy);
+    return compute_dynamic_offset(copy, strides, axes, s);
+  }
+
   // Kernel to compute offset here.
   array offset({1}, int64, nullptr, {});
   bool donate = indices.is_donatable() &&
@@ -58,8 +65,8 @@ array compute_dynamic_offset(
     offset.copy_shared_buffer(indices);
   } else {
     offset.set_data(allocator::malloc(offset.itemsize()));
+    compute_encoder.add_temporary(offset);
   }
-  compute_encoder.add_temporary(offset);
 
   auto dtype = indices.dtype();
   std::string lib_name = "compute_dynamic_offset_" + type_to_name(dtype);
